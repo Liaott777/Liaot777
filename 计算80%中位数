@@ -1,0 +1,33 @@
+import pandas as pd
+
+# 1. 读取 CSV 文件（替换为你的文件路径）
+df = pd.read_csv(r'xxxx')  # 例如 'data/trip_data.csv'
+
+# 2. 指定需要计算的列
+cols_to_calculate = [
+    'bus_trip_count', 'subway_trip_count', 'subway_trip_distance',
+    'taxi_trip_count', 'taxi_trip_distance',
+    'bike_trip_count', 'bike_trip_duration', 'ferry_trip_count'
+]
+
+# 3. 定义函数：计算每组前80%数据的中位数
+def compute_80_percent_median(group):
+    result = {}
+    for col in cols_to_calculate:
+        sorted_values = group[col].dropna().sort_values()
+        top_80_count = int(len(sorted_values) * 0.5)
+        if top_80_count == 0:
+            median_80 = None
+        else:
+            median_80 = sorted_values.iloc[:top_80_count].median()
+        result[col + '_80pct_median'] = median_80
+    return pd.Series(result)
+
+# 4. 按 cluster 分组并应用函数
+result_df = df.groupby('Cluster').apply(compute_80_percent_median).reset_index()
+
+# 5. 输出结果（可选择保存为新CSV）
+print(result_df)
+
+# 可选：保存结果
+result_df.to_csv(r'xxxx', index=False)
