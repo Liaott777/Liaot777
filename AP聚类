@@ -1,0 +1,72 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.cluster import AffinityPropagation
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+
+# 读取 CSV 文件
+file_path = r"xxxx"  # 请替换为你的文件路径
+df = pd.read_csv(file_path).head(20000)
+
+# 选择需要进行聚类的列
+columns_to_cluster = [
+    # 'metro', 'bus', 'taxi', 'bike', 'ferry'
+    'bus_trip_count', 'subway_trip_count', 'subway_trip_distance',
+    'taxi_trip_count', 'taxi_trip_distance',
+    'bike_trip_count', 'bike_trip_duration', 'ferry_trip_count'
+]
+data = df[columns_to_cluster].copy()  # 复制所需列数据
+
+# 归一化处理
+scaler = MinMaxScaler()
+normalized_data = scaler.fit_transform(data)
+
+# 进行 Affinity Propagation 聚类
+ap = AffinityPropagation(damping=0.9, preference=-20, random_state=42)
+clusters = ap.fit_predict(normalized_data)
+
+# 将聚类结果添加到原始数据
+df['cluster'] = clusters
+
+# 计算每个簇的 80% 分位数（即 80% 中位值）
+cluster_quantiles = pd.DataFrame(columns=columns_to_cluster)
+for cluster_id in np.unique(clusters):
+    cluster_data = data[np.array(clusters) == cluster_id]
+    cluster_quantiles.loc[cluster_id] = cluster_data.quantile(0.8)  # 计算80%分位数
+
+# 打印 80% 分位数作为代表值
+print("Cluster 80% Quantiles (Representative Values):")
+print(cluster_quantiles)
+
+# 保存带有聚类标签的原始数据到新的 CSV 文件
+output_file_path = r"xxxx"  # 输出文件路径
+df.to_csv(output_file_path, index=False)
+
+# 计算聚类评价指标
+silhouette = silhouette_score(normalized_data, clusters)
+db_index = davies_bouldin_score(normalized_data, clusters)
+ch_index = calinski_harabasz_score(normalized_data, clusters)
+
+print(f"Silhouette Score: {silhouette:.4f}")
+print(f"Davies-Bouldin Index: {db_index:.4f} (越小越好)")
+print(f"Calinski-Harabasz Index: {ch_index:.4f} (越大越好)")
+
+# 使用 PCA 降维进行可视化
+pca = PCA(n_components=2)
+pca_result = pca.fit_transform(normalized_data)
+
+# 创建 PCA 数据框
+pca_df = pd.DataFrame(pca_result, columns=['pca_1', 'pca_2'])
+pca_df['cluster'] = clusters  # 添加聚类标签
+
+# 绘制 PCA 可视化
+plt.figure(figsize=(10, 6))
+sns.scatterplot(x=pca_df['pca_1'], y=pca_df['pca_2'], hue=pca_df['cluster'], palette="viridis", alpha=0.7)
+plt.title("PCA Visualization of AP Clustering")
+plt.xlabel("PCA Component 1")
+plt.ylabel("PCA Component 2")
+plt.legend(title="Cluster")
+plt.show()
