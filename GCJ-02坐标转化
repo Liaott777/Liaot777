@@ -1,0 +1,67 @@
+import requests
+import pandas as pd
+import time
+
+# 高德地图API的URL和你的API Key
+url = "https://restapi.amap.com/v3/assistant/coordinate/convert"
+api_key = "xxxx"  # 替换为你的高德API Key
+
+# 读取Excel文件
+excel_file = r"xxxx"  # 使用原始字符串
+df = pd.read_excel(excel_file)
+
+# 定义转换函数
+def convert_coordinates(lon, lat):
+    """将WGS84坐标转换为GCJ-02坐标"""
+    params = {
+        "key": api_key,
+        "locations": f"{lon},{lat}",
+        "coordsys": "gps"  # WGS84坐标系
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)  # 设置超时时间
+        if response.status_code == 200:
+            result = response.json()
+            if result["status"] == "1":
+                gcj_lon, gcj_lat = result["locations"].split(",")
+                return float(gcj_lat), float(gcj_lon)
+            else:
+                print(f"转换失败: {result['info']}")
+                return None, None
+        else:
+            print(f"请求失败: {response.status_code}")
+            return None, None
+    except Exception as e:
+        print(f"请求异常: {e}")
+        return None, None
+
+# 初始化新列
+df["Start GCJ Latitude"] = None
+df["Start GCJ Longitude"] = None
+df["End GCJ Latitude"] = None
+df["End GCJ Longitude"] = None
+
+# 遍历所有行并转换坐标
+total_rows = len(df)
+for index, row in df.iterrows():
+    # 打印当前处理状态
+    print(f"正在处理第 {index + 1} / {total_rows} 行...")
+
+    # 转换 Start 坐标
+    start_lat, start_lon = convert_coordinates(row["Start Longitude"], row["Start Latitude"])
+    df.at[index, "Start GCJ Latitude"] = start_lat
+    df.at[index, "Start GCJ Longitude"] = start_lon
+
+    # 转换 End 坐标
+    end_lat, end_lon = convert_coordinates(row["End Longitude"], row["End Latitude"])
+    df.at[index, "End GCJ Latitude"] = end_lat
+    df.at[index, "End GCJ Longitude"] = end_lon
+
+    # 延时0.33秒，确保每秒最多3次请求
+    time.sleep(0.33)
+
+# 保存转换后的Excel文件
+output_file = r"xxxx"  # 使用原始字符串
+df.to_excel(output_file, index=False)
+
+print(f"所有坐标转换完成并已保存到 {output_file}")
