@@ -1,0 +1,157 @@
+import requests
+import pandas as pd
+import time
+import numpy as np
+
+# 高德API配置
+AMAP_API_KEY = 'xxxx'  # 替换为你的高德API密钥
+API_URLS = {
+    'walking': "https://restapi.amap.com/v3/direction/walking",
+    'bicycling': "https://restapi.amap.com/v4/direction/bicycling",
+    'driving': "https://restapi.amap.com/v3/direction/driving",
+    'transit': "https://restapi.amap.com/v3/direction/transit/integrated"
+}
+
+# 获取路径距离的函数
+def get_distance(origin, destination, mode, city='上海'):
+    """
+    根据交通方式获取实际距离
+    :param origin: 起点经纬度，格式为 '经度,纬度'
+    :param destination: 终点经纬度，格式为 '经度,纬度'
+    :param mode: 交通方式（1-Walk, 2-bicycle, 3-e-bicycle, 4-car, 5-bus, 6-shuttle, 7-subway）
+    :param city: 城市名称（公交/地铁需要）
+    :return: 距离（公里）或 None
+    """
+    if mode == 1:  # 步行
+        url = API_URLS['walking']
+        params = {
+            'key': AMAP_API_KEY,
+            'origin': origin,
+            'destination': destination
+        }
+    elif mode in [2, 3]:  # 骑行（普通自行车/电动车）
+        url = API_URLS['bicycling']
+        params = {
+            'key': AMAP_API_KEY,
+            'origin': origin,
+            'destination': destination
+        }
+    elif mode in [4, 6]:  # 驾车（包含接驳车）
+        url = API_URLS['driving']
+        params = {
+            'key': AMAP_API_KEY,
+            'origin': origin,
+            'destination': destination,
+            'extensions': 'base',
+            'strategy': 0  # 最快路线
+        }
+    elif mode in [5, 7]:  # 公交/地铁
+        url = API_URLS['transit']
+        params = {
+            'key': AMAP_API_KEY,
+            'origin': origin,
+            'destination': destination,
+            'city': city,
+            'extensions': 'base'
+        }
+    else:
+        print(f"未知的交通方式: {mode}")
+        return None
+
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+
+        # 检查返回状态
+        if data['status'] == '1':
+            if mode in [5, 7]:  # 公交/地铁
+                if 'route' in data and 'transits' in data['route'] and len(data['route']['transits']) > 0:
+                    distance = int(data['route']['transits'][0]['distance']) / 1000
+                    return round(distance, 3)
+            elif mode in [1, 2, 3, 4, 6]:  # 步行/骑行/驾车
+                if 'route' in data and 'paths' in data['route'] and len(data['route']['paths']) > 0:
+                    distance = int(data['route']['paths'][0]['distance']) / 1000
+                    return round(distance, 3)
+        else:
+            print(f"路径未找到: {data.get('info')}")
+            return None
+    except Exception as e:
+        print(f"请求错误: {e}")
+        return None
+
+# 处理OD点的距离计算，支持中途保存
+def calculate_distances_with_checkpoint(input_file, output_file, checkpoint_file):
+    """
+    根据交通方式计算OD点的实际距离，当公交路径未找到时，使用驾车路径替代
+    跳过出行方式为0的记录
+    :param input_file: 输入文件路径，包含OD点的经纬度和出行方式
+    :param output_file: 输出文件路径，保存最终结果
+    :param checkpoint_file: 中途保存文件路径
+    """
+    # 读取原始输入文件
+    df = pd.read_excel(input_file)
+
+    # 初始化结果列
+    if 'Distance (km)' not in df.columns:
+        df['Distance (km)'] = pd.Series(dtype=float)
+
+    # 加载检查点文件
+    try:
+        checkpoint_df = pd.read_excel(checkpoint_file)
+        start_index = len(checkpoint_df)  # 从检查点的最后一条记录继续处理
+        distances = np.full(len(df), np.nan)  # 初始化为NaN，长度与原始输入文件一致
+        distances[:start_index] = checkpoint_df['Distance (km)']  # 加载已完成的距离
+        print(f"加载检查点文件，从第 {start_index + 1} 条记录继续处理...")
+    except FileNotFoundError:
+        start_index = 0
+        distances = np.full(len(df), np.nan)  # 初始化结果为NaN
+        print("未找到检查点文件，从头开始计算...")
+
+    # 遍历数据并计算距离
+    for i in range(start_index, len(df)):
+        row = df.iloc[i]
+        start_lon, start_lat = row['Start Longitude'], row['Start Latitude']
+        end_lon, end_lat = row['End Longitude'], row['End Latitude']
+        mode = row['出行方式']
+
+        origin = f"{start_lon},{start_lat}"
+        destination = f"{end_lon},{end_lat}"
+
+        # 跳过出行方式为0的记录
+        if mode == 0:
+            print(f"第 {i + 1} 条记录跳过，出行方式为 0")
+            distances[i] = np.nan
+            continue
+
+        print(f"正在处理第 {i + 1} 条记录，出行方式 {mode}")
+
+        # 调用对应交通方式的API获取距离
+        distance = get_distance(origin, destination, mode)
+        if distance is None and mode in [5, 7]:  # 如果公交/地铁路径未找到，则改用驾车路径
+            print("公交/地铁路径未找到，尝试使用驾车路径...")
+            distance = get_distance(origin, destination, mode=4)
+
+        distances[i] = distance if distance is not None else np.nan
+
+        # 保存中间结果到检查点文件
+        df['Distance (km)'] = distances
+        df.iloc[:i + 1].to_excel(checkpoint_file, index=False)
+        print(f"已保存第 {i + 1} 条记录到检查点文件 {checkpoint_file}")
+
+        # 控制请求频率，避免触发API限制
+        time.sleep(1)
+
+    # 最终保存完整结果到输出文件
+    df['Distance (km)'] = distances
+    df.to_excel(output_file, index=False)
+    print(f"所有记录处理完成，最终结果已保存到 {output_file}")
+
+# 主程序入口
+if __name__ == "__main__":
+    input_file = r'xxxx'  # 输入文件路径
+    output_file = r'xxxx'  # 输出文件路径
+    checkpoint_file = r'xxxx'  # 检查点文件路径
+
+    print("开始计算OD点的实际距离...")
+    calculate_distances_with_checkpoint(input_file, output_file, checkpoint_file)
+    print("计算完成，结果已保存！")
