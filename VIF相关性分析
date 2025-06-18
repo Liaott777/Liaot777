@@ -1,0 +1,33 @@
+import pandas as pd
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools.tools import add_constant
+
+# 读取数据
+df = pd.read_csv(r'xxxx')
+
+# 修改点1：明确指定需要分析的特定列
+specific_columns = ['bus_trip_count', 'subway_trip_count', 'subway_trip_distance',
+        'taxi_trip_count', 'taxi_trip_distance',
+        'bike_trip_count', 'bike_trip_duration', 'ferry_trip_count']  # 替换为实际想分析的列名
+df_data = df[specific_columns]
+
+# 添加常数项
+df_data_with_const = add_constant(df_data)
+
+# 计算VIF
+vif_data = pd.DataFrame()
+vif_data["Feature"] = df_data_with_const.columns
+vif_data["VIF"] = [variance_inflation_factor(df_data_with_const.values, i)
+                  for i in range(df_data_with_const.shape[1])]
+
+# 打印结果
+print(vif_data)
+
+# 处理高VIF值的特征
+threshold = 10  # VIF阈值，通常5或10
+high_vif_features = vif_data[vif_data['VIF'] > threshold]['Feature'].tolist()
+
+if 'const' in high_vif_features:
+    high_vif_features.remove('const')  # 移除常数项
+
+print("\n需要处理的特征（VIF > 10）:", high_vif_features)
