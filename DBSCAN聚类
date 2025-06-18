@@ -1,0 +1,102 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
+
+# 读取数据
+file_path = r'xxxx'
+df = pd.read_csv(file_path)
+
+# 选择需要进行聚类的列
+columns_to_cluster = [
+    'bus_trip_count', 'subway_trip_count', 'subway_trip_distance',
+    'taxi_trip_count', 'taxi_trip_distance',
+    'bike_trip_count', 'bike_trip_duration', 'ferry_trip_count'
+]
+data = df[columns_to_cluster].values
+
+# 1. 数据归一化
+scaler = MinMaxScaler()
+data_normalized = scaler.fit_transform(data)
+
+# 2. 使用 DBSCAN 进行聚类
+dbscan_model = DBSCAN(eps=0.5, min_samples=5)  # 设置eps和min_samples值
+clusters = dbscan_model.fit_predict(data_normalized)
+
+# 3. 将聚类结果添加到原始数据中
+df['Cluster'] = clusters
+
+# 4. 使用 PCA 降维到 2 维
+pca = PCA(n_components=2)
+pca_result = pca.fit_transform(data_normalized)
+
+# 5. 创建 PCA 数据框并添加聚类结果
+pca_df = pd.DataFrame(pca_result, columns=['PCA_1', 'PCA_2'])
+pca_df['Cluster'] = clusters
+
+# 6. 可视化聚类结果
+plt.figure(figsize=(10, 8))
+plt.title('PCA Visualization of DBSCAN Clustering', fontsize=16)
+scatter = plt.scatter(pca_df['PCA_1'], pca_df['PCA_2'], c=pca_df['Cluster'], cmap='viridis', alpha=0.7, s=30)
+plt.colorbar(scatter, label='Cluster')
+plt.xlabel('PCA Component 1')
+plt.ylabel('PCA Component 2')
+plt.show()
+
+# 输出部分结果查看
+print(df[['bus_trip_count', 'subway_trip_count', 'subway_trip_distance',
+          'taxi_trip_count', 'taxi_trip_distance',
+          'bike_trip_count', 'bike_trip_duration', 'ferry_trip_count', 'Cluster']].head())
+
+# 计算聚类评估指标
+silhouette = silhouette_score(data_normalized, clusters)
+db_index = davies_bouldin_score(data_normalized, clusters)
+ch_index = calinski_harabasz_score(data_normalized, clusters)
+
+print(f"Silhouette Score: {silhouette:.4f}")
+print(f"Davies-Bouldin Index: {db_index:.4f} (越小越好)")
+print(f"Calinski-Harabasz Index: {ch_index:.4f} (越大越好)")
+
+# 7. 保存聚类结果到新的文件
+output_file_path = r'C:\Users\777\Desktop\研究生\hzy毕设\数据\随申行\第五次汇报\非常用用户\DBSCAN聚类结果.csv'
+df.to_csv(output_file_path, index=False, encoding='utf-8-sig')
+print(f"聚类结果已保存到 {output_file_path}")
+
+# 8. 计算每个簇的80%中位值和样本数
+unique_clusters = df['Cluster'].unique()  # 获取所有唯一的簇标签（包括-1表示噪声）
+median_80_dict = {col: [] for col in columns_to_cluster}  # 存储每列的80%中位值
+median_80_dict['Cluster'] = []  # 存储簇标签
+median_80_dict['Cluster_Size'] = []  # 存储每个簇的样本数
+
+for cluster in unique_clusters:
+    cluster_data = df[df['Cluster'] == cluster]  # 筛选当前簇的数据
+    cluster_size = len(cluster_data)  # 计算当前簇的样本数
+    median_80_dict['Cluster'].append(cluster)  # 添加簇标签
+    median_80_dict['Cluster_Size'].append(cluster_size)  # 添加样本数
+    for column in columns_to_cluster:
+        if column in df.columns:
+            # 对当前簇的列数据排序并取前80%
+            sorted_data = np.sort(cluster_data[column].dropna())
+            cutoff_index = int(len(sorted_data) * 0.8)  # 计算80%的位置
+            data_80_percent = sorted_data[:cutoff_index]  # 取前80%数据
+            median_80 = np.median(data_80_percent) if len(data_80_percent) > 0 else np.nan
+            median_80_dict[column].append(median_80)
+        else:
+            print(f"警告：列 '{column}' 不存在于数据中，已跳过。")
+            median_80_dict[column].append(np.nan)
+
+# 将结果转换为DataFrame，以簇为行
+median_80_df = pd.DataFrame(median_80_dict)
+median_80_df.set_index('Cluster', inplace=True)
+
+# 9. 保存80%中位值和样本数结果到新文件
+median_output_path = r'xxxx'
+median_80_df.to_csv(median_output_path, encoding='utf-8-sig')
+print(f"每个簇的80%中位值和样本数已保存到 {median_output_path}")
+
+# 输出80%中位值和样本数结果查看
+print("\n每个簇的80%中位值和样本数：")
+print(median_80_df)
