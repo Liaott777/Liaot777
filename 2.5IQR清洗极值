@@ -1,0 +1,44 @@
+import pandas as pd
+import numpy as np
+
+# 文件路径
+input_path = r"xxxx"
+output_path = r"xxxx"
+
+# 读取CSV文件
+df = pd.read_csv(input_path)
+
+# 需要处理的列
+columns_to_process = [
+    'bus_trip_count', 'subway_trip_count', 'subway_trip_distance',
+    'taxi_trip_count', 'taxi_trip_distance',
+    'bike_trip_count', 'bike_trip_duration', 'ferry_trip_count'
+]
+
+# 创建一个副本以保留原始数据
+df_cleaned = df.copy()
+
+# 对每一列应用2.5倍IQR规则，将异常值替换为NaN
+for column in columns_to_process:
+    if column in df.columns:  # 确保列存在
+        Q1 = df[column].quantile(0.25)
+        Q3 = df[column].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 2.5 * IQR
+        upper_bound = Q3 + 2.5 * IQR
+        # 将超出范围的值替换为NaN
+        df_cleaned[column] = df_cleaned[column].where(
+            (df_cleaned[column] >= lower_bound) & (df_cleaned[column] <= upper_bound),
+            np.nan
+        )
+    else:
+        print(f"警告：列 '{column}' 不存在于数据中，已跳过。")
+
+# 保存处理后的数据到新CSV文件
+df_cleaned.to_csv(output_path, index=False, encoding='utf-8-sig')  # 使用utf-8-sig以支持中文
+
+# 输出异常值统计
+for column in columns_to_process:
+    if column in df.columns:
+        nan_count = df_cleaned[column].isna().sum() - df[column].isna().sum()
+        print(f"列 '{column}' 中替换为NaN的异常值数量: {nan_count}")
