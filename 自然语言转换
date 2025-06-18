@@ -1,0 +1,227 @@
+import pandas as pd
+import numpy as np
+
+# 读取数据，按需修改路径和编码
+df = pd.read_csv(r'xxxx')
+df['travel_start_time'] = pd.to_datetime(df['travel_start_time'], errors='coerce')
+
+# 筛选3月1日至28日
+df_filtered = df[(df['travel_start_time'].dt.date >= pd.to_datetime('2024-03-01').date()) &
+                 (df['travel_start_time'].dt.date <= pd.to_datetime('2024-03-28').date())]
+
+# 缺失值填充
+df_filtered['start_lat'] = df_filtered['start_lat'].fillna(0)
+df_filtered['start_lon'] = df_filtered['start_lon'].fillna(0)
+df_filtered['end_lat'] = df_filtered['end_lat'].fillna(0)
+df_filtered['end_lon'] = df_filtered['end_lon'].fillna(0)
+df_filtered['pay_amt'] = df_filtered['pay_amt'].fillna(0)
+df_filtered['duration'] = df_filtered['duration'].fillna(0)
+df_filtered['distance'] = df_filtered['distance'].fillna(0)
+df_filtered['start_station'] = df_filtered['start_station'].fillna('未知起点')
+df_filtered['end_station'] = df_filtered['end_station'].fillna('未知终点')
+
+# ------------------ 区间定义 ------------------
+
+def generate_intervals(start, end, step, include_inf=False):
+    bins = list(np.arange(start, end + step, step))
+    if include_inf:
+        bins.append(float('inf'))
+    return bins
+
+def format_interval(left, right):
+    left_str = str(int(left) if left == int(left) else left)
+    if right == float('inf'):
+        right_str = f"{left_str}+"
+    else:
+        right_str = str(int(right) if right == int(right) else right)
+    return f"({left_str},{right_str})"
+
+
+def assign_interval(value, bins):
+    if pd.isna(value):
+        return '(未知)'
+    idx = np.digitize([value], bins, right=True)[0]
+    if idx == 0:
+        idx = 1
+    if idx > len(bins) -1:
+        idx = len(bins) -1
+    return format_interval(bins[idx-1], bins[idx])
+
+# 费用区间：0~78，步长2，共39个区间 + (400,+∞)
+cost_bins = generate_intervals(0, 80, 5, include_inf=False)
+cost_bins.append(float('inf'))
+
+# 2小时区间，(0,2], (2,4], ..., (22,24]
+time_bins = generate_intervals(0, 24, 2, include_inf=False)
+
+# share_bike耗时区间：0,30,55,...250,+∞，10个区间
+share_bike_duration_bins = [0,30,60,90,120,150,180,210,240,270,300,float('inf')]
+
+# 次数区间：0,2,4,...18,+∞，共10个区间
+count_bins = [0,2,4,6,8,10,12,14,16,18,float('inf')]
+
+# 距离区间：0~78，步长2，共39个区间 + +∞
+distance_bins = generate_intervals(0, 80, 5, include_inf=True)
+
+# ------------------ 时间处理 ------------------
+
+# 用数字0~6映射为工作日或非工作日
+weekday_map = ['工作日，','工作日，','工作日，','工作日，','工作日，','非工作日，','非工作日，']
+
+
+def get_weekday_and_week(travel_time):
+    base_date = pd.Timestamp('2024-03-01')  # 2024-03-01是周五
+    days_diff = (travel_time.date() - base_date.date()).days
+    weekday = (4 + days_diff) % 7
+    week = days_diff // 7 + 1
+    return weekday, week
+
+def categorize_2h_period(hour):
+    if 0 <= hour < 5:
+        return '凌晨时间段'
+    elif 5 <= hour < 12:
+        return '早上时间段'
+    elif 12 <= hour < 18:
+        return '下午时间段'
+    elif 18 <= hour < 24:
+        return '晚上时间段'
+    else:
+        return None
+
+
+# ------------------ 次数统计 ------------------
+
+def calc_count_intervals(df):
+    counts = df.groupby(['uid', 'trip_mode']).size().reset_index(name='count')
+    counts['count_interval'] = counts['count'].apply(lambda x: assign_interval(x, count_bins))
+    count_dict = {}
+    for _, row in counts.iterrows():
+        count_dict[(row['uid'], row['trip_mode'])] = row['count_interval']
+    return count_dict
+
+count_intervals_dict = calc_count_intervals(df_filtered)
+
+# ------------------ 自然语言描述 ------------------
+
+def generate_description(row):
+    dt = row['travel_start_time']
+    weekday, _ = get_weekday_and_week(dt)
+    weekday_str = weekday_map[weekday]
+    period_2h = categorize_2h_period(dt.hour)
+    if period_2h is None:
+        return None
+
+    mode = 'taxi' if row['trip_mode'] == 'car_hailing' else row['trip_mode']
+
+    start = row['start_station']
+    end = row['end_station']
+    cost = row['pay_amt']
+    duration = row['duration']
+    distance = row['distance']
+    start_lat = row['start_lat']
+    start_lon = row['start_lon']
+    end_lat = row['end_lat']
+    end_lon = row['end_lon']
+
+    cost_interval = '(不适用)'
+    if mode != 'bus':
+        cost_interval = assign_interval(cost, cost_bins)
+
+    duration_interval = '(不适用)'
+    if mode == 'share_bike':
+        duration_interval = assign_interval(duration, share_bike_duration_bins)
+
+    distance_interval = '(不适用)'
+    if mode not in ['bus', 'ferry', 'share_bike']:
+        distance_interval = assign_interval(distance, distance_bins)
+
+    count_interval = count_intervals_dict.get((row['uid'], row['trip_mode']), '(未知)')
+
+    if mode == 'metro':
+        if start_lat == 0 or start_lon == 0 or end_lat == 0 or end_lon == 0:
+            loc_desc = f"{weekday_str}{period_2h}乘坐metro"
+        else:
+            loc_desc = f"{weekday_str}{period_2h}乘坐metro从 {start} 到 {end}"
+    elif mode == 'bus':
+        if start_lat == 0 or start_lon == 0:
+            loc_desc = f"{weekday_str}{period_2h}乘坐bus"
+        else:
+            loc_desc = f"{weekday_str}{period_2h}乘坐bus从 {start} 出发"
+        cost_interval = ''
+        duration_interval = ''
+        distance_interval = ''
+    elif mode in ['share_bike', 'ferry']:
+        loc_desc = f"{weekday_str}{period_2h}乘坐{mode}"
+    elif mode == 'taxi':
+        if start_lat == 0 or start_lon == 0 or end_lat == 0 or end_lon == 0:
+            loc_desc = f"{weekday_str}{period_2h}乘坐taxi"
+        else:
+            loc_desc = f"{weekday_str}{period_2h}乘坐taxi从 {start} 到 {end}"
+    else:
+        loc_desc = f"{weekday_str}{period_2h}乘坐{mode}从 {start} 到 {end}"
+
+    parts = [loc_desc]
+
+    if cost_interval and cost_interval != '(不适用)':
+        parts.append(f"{mode}花费{cost_interval}")
+    if mode == 'share_bike' and duration_interval != '(不适用)':
+        parts.append(f"{mode}耗时{duration_interval}")
+    if distance_interval and distance_interval != '(不适用)':
+        parts.append(f"{mode}行程{distance_interval}")
+
+
+    parts = [p for p in parts if p]
+
+    return "，".join(parts)
+
+
+# ------------------ 总花费区间及各交通方式费用统计 ------------------
+
+def total_cost_interval(user_df):
+    total_cost = user_df['pay_amt'].sum()
+    return assign_interval(total_cost, cost_bins)
+
+def cost_by_mode(user_df):
+    costs = user_df.groupby('trip_mode')['pay_amt'].sum()
+    cost_parts = []
+    for mode, c in costs.items():
+        key_mode = 'taxi' if mode == 'car_hailing' else mode
+        c_interval = assign_interval(c, cost_bins)
+        cost_parts.append(f"{key_mode}总花费{c_interval}")
+    return "，".join(cost_parts)
+
+# ------------------ 主流程 ------------------
+
+user_descriptions = []
+
+for uid, user_group in df_filtered.groupby('uid'):
+    user_group = user_group.copy()
+    user_group['desc'] = user_group.apply(generate_description, axis=1)
+    user_group = user_group[user_group['desc'].notnull()]
+    user_group = user_group.sort_values(by='travel_start_time')
+
+    daily_texts = []
+    for date, day_group in user_group.groupby(user_group['travel_start_time'].dt.date):
+        daily_descs = day_group['desc'].tolist()
+        daily_text = "，".join(daily_descs)
+        daily_texts.append(daily_text)
+
+    total_cost_str = total_cost_interval(user_group)
+    mode_costs_str = cost_by_mode(user_group)
+
+    # 统计各交通方式的次数，生成次数区间描述字符串
+    mode_counts = user_group['trip_mode'].replace({'car_hailing': 'taxi'}).value_counts()
+    count_desc_list = []
+    for mode, cnt in mode_counts.items():
+        cnt_interval = assign_interval(cnt, count_bins)
+        count_desc_list.append(f"{mode}次数{cnt_interval}")
+    count_desc_str = "，".join(count_desc_list)
+
+    full_text = "。".join(daily_texts)
+    full_text += f"。该周期内总花费{total_cost_str}，{mode_costs_str}，{count_desc_str}。"
+    user_descriptions.append([uid, full_text])
+
+
+
+output_df = pd.DataFrame(user_descriptions, columns=['uid', 'description'])
+output_df.to_excel(r'xxxx', index=False)
