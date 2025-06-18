@@ -1,0 +1,26 @@
+import pandas as pd
+
+# 读取原始Excel文件
+input_file = r'xxxx'  # 输入文件路径
+df = pd.read_excel(input_file)
+
+# 筛选出“出行方式”为8的行
+filtered_df = df[df['出行方式'] == 8]
+print("筛选出'出行方式'为8的行：")
+print(filtered_df.head())  # 调试输出，查看筛选结果
+
+# 提取“出行方式”为8的行中的所有“用户编号”
+user_ids = filtered_df['用户编号'].unique()
+print("筛选出'出行方式'为8的用户编号：")
+print(user_ids)  # 调试输出，查看用户编号
+
+# 筛选出所有“用户编号”在这些用户编号中的行
+final_filtered_df = df[df['用户编号'].isin(user_ids)]
+print("最终筛选的行：")
+print(final_filtered_df.head())  # 调试输出，查看最终筛选结果
+
+# 将筛选后的数据保存到新的Excel文件
+output_file = r'xxxx'  # 输出文件路径
+final_filtered_df.to_excel(output_file, index=False)
+
+print(f"已将筛选后的数据保存到 {output_file}")
