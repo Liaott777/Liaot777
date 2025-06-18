@@ -1,0 +1,80 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+# 1. 读取数据
+df = pd.read_csv(r'xxxx')
+
+# 2. 定义需要降维的特征对
+feature_pairs = {
+    'subway': ['subway_trip_count', 'subway_trip_distance'],
+    'taxi': ['taxi_trip_count', 'taxi_trip_distance'],
+    'bike': ['bike_trip_count', 'bike_trip_duration']
+}
+
+# 3. 对三组特征进行PCA降维
+pca_results = {}
+scaler_pca = StandardScaler()
+pca = PCA(n_components=1)  # 每组降到1维
+
+for mode, columns in feature_pairs.items():
+    # 提取数据并填充缺失值
+    X = df[columns].fillna(df[columns].mean()).values  # 用均值填充缺失值
+    if len(X) == 0:
+        print(f"警告：{mode}组数据为空，跳过处理")
+        continue
+
+    # 标准化
+    X_scaled = scaler_pca.fit_transform(X)
+    # PCA降维
+    X_pca = pca.fit_transform(X_scaled)
+    pca_results[mode] = pd.Series(X_pca.flatten(), name=f'{mode}_PC1', index=df.index)
+
+    print(f"{mode}组的解释方差比例：{pca.explained_variance_ratio_[0]:.4f} "
+          f"({pca.explained_variance_ratio_[0] * 100:.2f}%)")
+
+# 4. 对 'bus_trip_count' 和 'ferry_trip_count' 进行标准化
+standardize_columns = ['bus_trip_count', 'ferry_trip_count']
+scaler_std = StandardScaler()
+X_std = df[standardize_columns].fillna(df[standardize_columns].mean()).values  # 用均值填充缺失值
+if np.all(np.isnan(X_std)):  # 检查是否全为NaN
+    print("警告：bus和ferry数据为空，标准化列将全为NaN")
+    df_standardized = pd.DataFrame(
+        np.nan,
+        index=df.index,
+        columns=[f'{col}_std' for col in standardize_columns]
+    )
+else:
+    X_standardized = scaler_std.fit_transform(X_std)
+    df_standardized = pd.DataFrame(
+        X_standardized,
+        columns=[f'{col}_std' for col in standardize_columns],
+        index=df.index
+    )
+
+# 5. 整合结果，检查并保留 'uid'（如果存在）
+df_final = pd.DataFrame(index=df.index)  # 初始化空数据框，使用原始索引
+
+# 检查 'uid' 是否存在，若存在则保留
+if 'uid' in df.columns:
+    df_final['uid'] = df['uid']
+    print("检测到 'uid' 列，已保留")
+else:
+    print("未检测到 'uid' 列，继续处理其他列")
+
+# 添加PCA结果（3列）
+for mode, pca_series in pca_results.items():
+    df_final[f'{mode}_PC1'] = pca_series
+
+# 添加标准化结果（2列）
+df_final = pd.concat([df_final, df_standardized], axis=1)
+
+# 6. 输出结果（不再需要dropna，因为已填充缺失值）
+print("\n最终数据（前5行）：")
+print(df_final.head())
+
+# 7. 保存到文件
+output_file = r'xxxx'
+df_final.to_csv(output_file, index=False)
+print(f"\n结果已保存到 '{output_file}'")
