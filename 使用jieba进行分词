@@ -1,0 +1,44 @@
+import re
+import jieba
+import pandas as pd
+
+# 1. 加载词典
+with open(r"xxxx", "r", encoding="utf-8") as f:
+    keyword_list = [line.strip().split()[0] for line in f if line.strip()]
+
+# 2. 编译词典成正则表达式（注意：长词优先）
+keyword_list = sorted(keyword_list, key=lambda x: -len(x))  # 防止短词截断长词
+pattern = re.compile("|".join(map(re.escape, keyword_list)))
+
+# 3. 定义分词函数：保留命中词，其他用jieba分
+def dictionary_guided_tokenize(text):
+    if not isinstance(text, str):
+        return []
+    result = []
+    last_end = 0
+    for match in pattern.finditer(text):
+        # 添加非命中区域用 jieba 分词
+        unmatched = text[last_end:match.start()]
+        if unmatched.strip():
+            result.extend(jieba.lcut(unmatched))
+        # 添加命中词
+        result.append(match.group())
+        last_end = match.end()
+    # 处理最后一段
+    if last_end < len(text):
+        unmatched = text[last_end:]
+        if unmatched.strip():
+            result.extend(jieba.lcut(unmatched))
+    return result
+
+# 4. 应用到 DataFrame
+df = pd.read_excel(r"xxxx")
+df['tokenized'] = df['description'].apply(dictionary_guided_tokenize)
+
+# 5. 保存结果
+df.to_excel(r"xxxx", index=False)
+
+print("✅ 分词完成，词典中的词保留，其他词也不会丢失")
+
+
+
