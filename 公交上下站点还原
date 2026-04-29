@@ -1,0 +1,843 @@
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+
+# =========================
+# 1. 路径配置
+# =========================
+INPUT_FILE = Path(r"xxx")
+OUTPUT_DIR = Path(r"xxx")
+OUTPUT_CSV = OUTPUT_DIR / "合并数据集_公交缺失还原后.csv"
+OUTPUT_TXT = OUTPUT_DIR / "公交缺失处理统计.txt"
+
+# =========================
+# 2. 字段配置
+# =========================
+UID_COL = "uid"
+TIME_COL = "travel_start_time"
+MODE_COL = "trip_mode"
+LINE_COL = "line"
+
+START_STATION_COL = "start_station"
+START_LAT_COL = "start_lat"
+START_LON_COL = "start_lon"
+END_STATION_COL = "end_station"
+END_LAT_COL = "end_lat"
+END_LON_COL = "end_lon"
+
+REQUIRED_COLS = [
+    UID_COL, TIME_COL, MODE_COL, LINE_COL,
+    START_STATION_COL, START_LAT_COL, START_LON_COL,
+    END_STATION_COL, END_LAT_COL, END_LON_COL,
+]
+
+BUS_MODE_VALUE = "bus"
+DICT_PRECISIONS = [6, 5, 4]  # 站点字典坐标匹配精度（逐级放宽）
+MAX_FILL_ITERATIONS = 10
+
+
+# =========================
+# 3. 工具函数
+# =========================
+def read_csv_auto_encoding(file_path: Path) -> tuple[pd.DataFrame, str]:
+    """自动尝试多种编码读取 CSV，尽量避免中文乱码。"""
+    encodings = ["utf-8-sig", "utf-8", "gb18030", "gbk"]
+    last_error = None
+    for enc in encodings:
+        try:
+            df = pd.read_csv(file_path, encoding=enc)
+            return df, enc
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"CSV 读取失败，请检查文件编码。最后一次报错：{last_error}")
+
+
+def normalize_null_like(series: pd.Series) -> pd.Series:
+    """将空字符串、空白、'null'、'nan' 等统一转为真正的缺失值。"""
+    s = series.copy()
+    s = s.replace(r"^\s*$", np.nan, regex=True)
+
+    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+        s = s.astype("string")
+        s = s.str.strip()
+        s = s.replace({
+            "": pd.NA,
+            "null": pd.NA,
+            "NULL": pd.NA,
+            "None": pd.NA,
+            "none": pd.NA,
+            "nan": pd.NA,
+            "NaN": pd.NA,
+            "NAN": pd.NA,
+        })
+    return s
+
+
+def normalize_line_value(series: pd.Series) -> pd.Series:
+    """规范化 line 字段，便于做相同线路匹配。"""
+    s = normalize_null_like(series).astype("string")
+    s = s.str.replace(r"\s+", "", regex=True)
+    s = s.str.replace(r"(?:＋|->|→|⇒|＞|>)+", "+", regex=True)
+    s = s.str.replace(r"\++", "+", regex=True)
+    s = s.str.strip("+")
+    s = s.str.lower()
+    s = s.replace({"": pd.NA})
+    return s
+
+
+def format_ratio(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0.00%"
+    return f"{numerator / denominator:.2%}"
+
+
+def get_bus_mask(df: pd.DataFrame) -> pd.Series:
+    return df[MODE_COL].astype("string").str.strip().str.lower().eq(BUS_MODE_VALUE)
+
+
+def get_bus_null_record_mask(df: pd.DataFrame) -> pd.Series:
+    bus_mask = get_bus_mask(df)
+    return bus_mask & (df[START_STATION_COL].isna() | df[END_STATION_COL].isna())
+
+
+def compute_newly_filled_mask(before_missing: dict, df: pd.DataFrame) -> pd.Series:
+    return (
+        (before_missing[START_STATION_COL] & df[START_STATION_COL].notna()) |
+        (before_missing[START_LAT_COL] & df[START_LAT_COL].notna()) |
+        (before_missing[START_LON_COL] & df[START_LON_COL].notna()) |
+        (before_missing[END_STATION_COL] & df[END_STATION_COL].notna()) |
+        (before_missing[END_LAT_COL] & df[END_LAT_COL].notna()) |
+        (before_missing[END_LON_COL] & df[END_LON_COL].notna())
+    )
+
+
+def capture_missing_state(df: pd.DataFrame) -> dict:
+    return {
+        START_STATION_COL: df[START_STATION_COL].isna(),
+        START_LAT_COL: df[START_LAT_COL].isna(),
+        START_LON_COL: df[START_LON_COL].isna(),
+        END_STATION_COL: df[END_STATION_COL].isna(),
+        END_LAT_COL: df[END_LAT_COL].isna(),
+        END_LON_COL: df[END_LON_COL].isna(),
+    }
+
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["_trip_date"] = df[TIME_COL].dt.date
+    df["_hour"] = df[TIME_COL].dt.hour
+    return df
+
+
+def add_clock_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    minutes = df[TIME_COL].dt.hour * 60 + df[TIME_COL].dt.minute
+    df["_minute_of_day"] = minutes
+    return df
+
+
+def build_station_dictionary(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[int, pd.Series]]:
+    """
+    基于公交完整站点记录构建站点字典：
+    1) station -> 典型(lat, lon)
+    2) rounded(lat, lon) -> 高频station
+    """
+    bus_df = df.loc[get_bus_mask(df)].copy()
+
+    start_part = bus_df[[START_STATION_COL, START_LAT_COL, START_LON_COL]].rename(
+        columns={
+            START_STATION_COL: "station",
+            START_LAT_COL: "lat",
+            START_LON_COL: "lon",
+        }
+    )
+    end_part = bus_df[[END_STATION_COL, END_LAT_COL, END_LON_COL]].rename(
+        columns={
+            END_STATION_COL: "station",
+            END_LAT_COL: "lat",
+            END_LON_COL: "lon",
+        }
+    )
+    station_obs = pd.concat([start_part, end_part], ignore_index=True)
+    station_obs = station_obs.dropna(subset=["station", "lat", "lon"]).copy()
+    station_obs["station"] = station_obs["station"].astype("string").str.strip()
+    station_obs = station_obs.dropna(subset=["station"])
+
+    if station_obs.empty:
+        station_to_coord = pd.DataFrame(columns=["station", "lat", "lon"])
+        coord_maps: dict[int, pd.Series] = {}
+        return station_to_coord, coord_maps
+
+    station_to_coord = (
+        station_obs.groupby("station", as_index=False)[["lat", "lon"]]
+        .median()
+    )
+
+    coord_maps: dict[int, pd.Series] = {}
+    for p in DICT_PRECISIONS:
+        tmp = station_obs.copy()
+        tmp[f"lat_r_{p}"] = tmp["lat"].round(p)
+        tmp[f"lon_r_{p}"] = tmp["lon"].round(p)
+        freq = (
+            tmp.groupby([f"lat_r_{p}", f"lon_r_{p}", "station"])
+            .size()
+            .reset_index(name="cnt")
+            .sort_values([f"lat_r_{p}", f"lon_r_{p}", "cnt", "station"], ascending=[True, True, False, True])
+        )
+        best = freq.drop_duplicates([f"lat_r_{p}", f"lon_r_{p}"])
+        key = best[f"lat_r_{p}"].astype(str) + "|" + best[f"lon_r_{p}"].astype(str)
+        coord_maps[p] = pd.Series(best["station"].astype("string").values, index=key.values)
+
+    return station_to_coord, coord_maps
+
+
+def fill_coords_from_station(df: pd.DataFrame, station_to_coord: pd.DataFrame,
+                             station_col: str, lat_col: str, lon_col: str,
+                             target_mask: pd.Series) -> None:
+    if station_to_coord.empty:
+        return
+    need_mask = target_mask & df[station_col].notna() & (df[lat_col].isna() | df[lon_col].isna())
+    if not need_mask.any():
+        return
+    mapper = station_to_coord.rename(columns={"station": station_col, "lat": "_dict_lat", "lon": "_dict_lon"})
+    merged = df.loc[need_mask, [station_col]].merge(mapper, on=station_col, how="left")
+    idx = df.index[need_mask]
+    lat_fill_mask = need_mask & df[lat_col].isna()
+    lon_fill_mask = need_mask & df[lon_col].isna()
+    df.loc[idx[lat_fill_mask[need_mask].values], lat_col] = merged.loc[lat_fill_mask[need_mask].values, "_dict_lat"].values
+    df.loc[idx[lon_fill_mask[need_mask].values], lon_col] = merged.loc[lon_fill_mask[need_mask].values, "_dict_lon"].values
+
+
+def fill_station_from_coords(df: pd.DataFrame, coord_maps: dict[int, pd.Series],
+                             station_col: str, lat_col: str, lon_col: str,
+                             target_mask: pd.Series) -> None:
+    need_mask = target_mask & df[station_col].isna() & df[lat_col].notna() & df[lon_col].notna()
+    if not need_mask.any():
+        return
+
+    for p in DICT_PRECISIONS:
+        still_need = target_mask & df[station_col].isna() & df[lat_col].notna() & df[lon_col].notna()
+        if not still_need.any() or p not in coord_maps:
+            continue
+        lat_r = df.loc[still_need, lat_col].round(p).astype(str)
+        lon_r = df.loc[still_need, lon_col].round(p).astype(str)
+        key = lat_r + "|" + lon_r
+        mapped_station = key.map(coord_maps[p])
+        fill_mask_local = mapped_station.notna().values
+        idx = df.index[still_need]
+        df.loc[idx[fill_mask_local], station_col] = mapped_station[fill_mask_local].values
+
+
+def build_home_anchor(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    基于“每日第一次出行起点”和“每日最后一次出行终点”构建家锚点。
+    两类观测合并后，对每个 uid 取最高频站点。
+    """
+    bus_df = df.loc[get_bus_mask(df)].copy()
+    bus_df = bus_df.dropna(subset=[UID_COL, "_trip_date", TIME_COL]).copy()
+    if bus_df.empty:
+        return pd.DataFrame(columns=[UID_COL, "_home_station"])
+
+    bus_df = bus_df.sort_values([UID_COL, "_trip_date", TIME_COL], kind="mergesort")
+
+    first_trip = (
+        bus_df.groupby([UID_COL, "_trip_date"], as_index=False)
+        .first()[[UID_COL, "_trip_date", START_STATION_COL]]
+        .rename(columns={START_STATION_COL: "home_candidate"})
+    )
+    last_trip = (
+        bus_df.groupby([UID_COL, "_trip_date"], as_index=False)
+        .last()[[UID_COL, "_trip_date", END_STATION_COL]]
+        .rename(columns={END_STATION_COL: "home_candidate"})
+    )
+
+    candidates = pd.concat([first_trip, last_trip], ignore_index=True)
+    candidates = candidates.dropna(subset=["home_candidate"]).copy()
+    if candidates.empty:
+        return pd.DataFrame(columns=[UID_COL, "_home_station"])
+
+    candidates["home_candidate"] = candidates["home_candidate"].astype("string").str.strip()
+    candidates = candidates.dropna(subset=["home_candidate"])
+    if candidates.empty:
+        return pd.DataFrame(columns=[UID_COL, "_home_station"])
+
+    freq = (
+        candidates.groupby([UID_COL, "home_candidate"])
+        .size()
+        .reset_index(name="cnt")
+        .sort_values([UID_COL, "cnt", "home_candidate"], ascending=[True, False, True])
+    )
+    best = freq.drop_duplicates([UID_COL])
+    return best[[UID_COL, "home_candidate"]].rename(columns={"home_candidate": "_home_station"})
+
+
+def build_line_profiles(df: pd.DataFrame) -> dict[str, object]:
+    """构建基于 uid+line 的历史线路画像。"""
+    bus_df = df.loc[get_bus_mask(df)].copy()
+    bus_df = bus_df.dropna(subset=[LINE_COL]).copy()
+    bus_df = add_clock_features(bus_df)
+
+    if bus_df.empty:
+        return {
+            "pair_overall": pd.DataFrame(),
+            "start_by_end": pd.DataFrame(),
+            "end_by_start": pd.DataFrame(),
+            "complete_pair_groups": {},
+        }
+
+    complete_pair = bus_df.dropna(subset=[START_STATION_COL, END_STATION_COL]).copy()
+    if complete_pair.empty:
+        return {
+            "pair_overall": pd.DataFrame(),
+            "start_by_end": pd.DataFrame(),
+            "end_by_start": pd.DataFrame(),
+            "complete_pair_groups": {},
+        }
+
+    pair_overall = (
+        complete_pair.groupby([UID_COL, LINE_COL, START_STATION_COL, END_STATION_COL], dropna=False)
+        .agg(
+            _start_lat_med=(START_LAT_COL, "median"),
+            _start_lon_med=(START_LON_COL, "median"),
+            _end_lat_med=(END_LAT_COL, "median"),
+            _end_lon_med=(END_LON_COL, "median"),
+            _cnt=(START_STATION_COL, "size"),
+        )
+        .reset_index()
+        .sort_values([UID_COL, LINE_COL, "_cnt", START_STATION_COL, END_STATION_COL], ascending=[True, True, False, True, True])
+        .drop_duplicates([UID_COL, LINE_COL])
+    )
+
+    start_by_end = (
+        complete_pair.groupby([UID_COL, LINE_COL, END_STATION_COL, START_STATION_COL], dropna=False)
+        .agg(
+            _start_lat_med=(START_LAT_COL, "median"),
+            _start_lon_med=(START_LON_COL, "median"),
+            _cnt=(START_STATION_COL, "size"),
+        )
+        .reset_index()
+        .sort_values([UID_COL, LINE_COL, END_STATION_COL, "_cnt", START_STATION_COL], ascending=[True, True, True, False, True])
+        .drop_duplicates([UID_COL, LINE_COL, END_STATION_COL])
+    )
+
+    end_by_start = (
+        complete_pair.groupby([UID_COL, LINE_COL, START_STATION_COL, END_STATION_COL], dropna=False)
+        .agg(
+            _end_lat_med=(END_LAT_COL, "median"),
+            _end_lon_med=(END_LON_COL, "median"),
+            _cnt=(END_STATION_COL, "size"),
+        )
+        .reset_index()
+        .sort_values([UID_COL, LINE_COL, START_STATION_COL, "_cnt", END_STATION_COL], ascending=[True, True, True, False, True])
+        .drop_duplicates([UID_COL, LINE_COL, START_STATION_COL])
+    )
+
+    complete_pair_groups = {
+        key: grp[[START_STATION_COL, END_STATION_COL, START_LAT_COL, START_LON_COL, END_LAT_COL, END_LON_COL, "_minute_of_day"]].copy()
+        for key, grp in complete_pair.groupby([UID_COL, LINE_COL], sort=False)
+    }
+
+    return {
+        "pair_overall": pair_overall,
+        "start_by_end": start_by_end,
+        "end_by_start": end_by_start,
+        "complete_pair_groups": complete_pair_groups,
+    }
+
+
+def _merge_by_index(left: pd.DataFrame, right: pd.DataFrame, on_cols: list[str]) -> pd.DataFrame:
+    tmp = left.copy()
+    tmp["_idx"] = tmp.index
+    merged = tmp.merge(right, on=on_cols, how="left")
+    merged = merged.set_index("_idx")
+    return merged
+
+
+def _minute_diff_with_wrap(target_minute: float, hist_minutes: pd.Series) -> pd.Series:
+    diff = (hist_minutes - target_minute).abs()
+    return np.minimum(diff, 1440 - diff)
+
+
+def _pick_pair_within_one_hour(group_df: pd.DataFrame, target_minute: float) -> dict | None:
+    if pd.isna(target_minute):
+        return None
+    if group_df.empty or "_minute_of_day" not in group_df.columns:
+        return None
+
+    diff = _minute_diff_with_wrap(target_minute, group_df["_minute_of_day"])
+    candidates = group_df.loc[diff <= 60].copy()
+    if candidates.empty:
+        return None
+
+    picked = (
+        candidates.groupby([START_STATION_COL, END_STATION_COL], dropna=False)
+        .agg(
+            _start_lat_med=(START_LAT_COL, "median"),
+            _start_lon_med=(START_LON_COL, "median"),
+            _end_lat_med=(END_LAT_COL, "median"),
+            _end_lon_med=(END_LON_COL, "median"),
+            _cnt=(START_STATION_COL, "size"),
+        )
+        .reset_index()
+        .sort_values(["_cnt", START_STATION_COL, END_STATION_COL], ascending=[False, True, True])
+        .iloc[0]
+    )
+    return picked.to_dict()
+
+
+def layer0_line_match_fill(df: pd.DataFrame) -> dict[str, int]:
+    """
+    第四层：基于同 uid 的历史 line 模式补全。
+    规则：
+    1) 仅起点缺：按 uid + line + 已知终点，在完整历史记录中查找对应起点。
+    2) 仅终点缺：按 uid + line + 已知起点，在完整历史记录中查找对应终点。
+    3) 起终点都缺：按 uid + line + 前后各一小时的时间窗查找最常见起终点对；若无，再按 uid + line 全局查找。
+    """
+    bus_mask = get_bus_mask(df)
+    line_ok = df[LINE_COL].notna()
+    profiles = build_line_profiles(df)
+
+    stats = {
+        "start_from_same_line_end_match": 0,
+        "end_from_same_line_start_match": 0,
+        "both_null_time_window": 0,
+        "both_null_line_global": 0,
+    }
+
+    if (
+        profiles["pair_overall"].empty
+        and profiles["start_by_end"].empty
+        and profiles["end_by_start"].empty
+        and not profiles["complete_pair_groups"]
+    ):
+        return stats
+
+    # ---------- A. 仅起点缺：已知终点 -> 反查起点 ----------
+    start_only_mask = bus_mask & line_ok & df[START_STATION_COL].isna() & df[END_STATION_COL].notna()
+    if start_only_mask.any() and not profiles["start_by_end"].empty:
+        key_cols = [UID_COL, LINE_COL, END_STATION_COL]
+        start_map = profiles["start_by_end"][[UID_COL, LINE_COL, END_STATION_COL, START_STATION_COL, "_start_lat_med", "_start_lon_med"]]
+        merged_start = _merge_by_index(df.loc[start_only_mask, key_cols], start_map, key_cols)
+        fill_idx = merged_start.index[merged_start[START_STATION_COL].notna()]
+        if len(fill_idx) > 0:
+            df.loc[fill_idx, START_STATION_COL] = merged_start.loc[fill_idx, START_STATION_COL]
+            lat_missing_idx = fill_idx[df.loc[fill_idx, START_LAT_COL].isna()]
+            lon_missing_idx = fill_idx[df.loc[fill_idx, START_LON_COL].isna()]
+            if len(lat_missing_idx) > 0:
+                df.loc[lat_missing_idx, START_LAT_COL] = merged_start.loc[lat_missing_idx, "_start_lat_med"]
+            if len(lon_missing_idx) > 0:
+                df.loc[lon_missing_idx, START_LON_COL] = merged_start.loc[lon_missing_idx, "_start_lon_med"]
+            stats["start_from_same_line_end_match"] += int(len(fill_idx))
+
+    # ---------- B. 仅终点缺：已知起点 -> 反查终点 ----------
+    end_only_mask = bus_mask & line_ok & df[END_STATION_COL].isna() & df[START_STATION_COL].notna()
+    if end_only_mask.any() and not profiles["end_by_start"].empty:
+        key_cols = [UID_COL, LINE_COL, START_STATION_COL]
+        end_map = profiles["end_by_start"][[UID_COL, LINE_COL, START_STATION_COL, END_STATION_COL, "_end_lat_med", "_end_lon_med"]]
+        merged_end = _merge_by_index(df.loc[end_only_mask, key_cols], end_map, key_cols)
+        fill_idx = merged_end.index[merged_end[END_STATION_COL].notna()]
+        if len(fill_idx) > 0:
+            df.loc[fill_idx, END_STATION_COL] = merged_end.loc[fill_idx, END_STATION_COL]
+            lat_missing_idx = fill_idx[df.loc[fill_idx, END_LAT_COL].isna()]
+            lon_missing_idx = fill_idx[df.loc[fill_idx, END_LON_COL].isna()]
+            if len(lat_missing_idx) > 0:
+                df.loc[lat_missing_idx, END_LAT_COL] = merged_end.loc[lat_missing_idx, "_end_lat_med"]
+            if len(lon_missing_idx) > 0:
+                df.loc[lon_missing_idx, END_LON_COL] = merged_end.loc[lon_missing_idx, "_end_lon_med"]
+            stats["end_from_same_line_start_match"] += int(len(fill_idx))
+
+    # ---------- C. 起终点都缺：优先前后各一小时 ----------
+    both_null_mask = bus_mask & line_ok & df[START_STATION_COL].isna() & df[END_STATION_COL].isna()
+    if both_null_mask.any():
+        target_df = add_clock_features(df.loc[both_null_mask, [UID_COL, LINE_COL, TIME_COL]].copy())
+
+        filled_time_window = []
+        for idx, row in target_df.iterrows():
+            key = (row[UID_COL], row[LINE_COL])
+            group_df = profiles["complete_pair_groups"].get(key)
+            if group_df is None or group_df.empty:
+                continue
+            picked = _pick_pair_within_one_hour(group_df, row["_minute_of_day"])
+            if picked is None:
+                continue
+
+            df.loc[idx, START_STATION_COL] = picked[START_STATION_COL]
+            df.loc[idx, END_STATION_COL] = picked[END_STATION_COL]
+            if pd.isna(df.loc[idx, START_LAT_COL]):
+                df.loc[idx, START_LAT_COL] = picked["_start_lat_med"]
+            if pd.isna(df.loc[idx, START_LON_COL]):
+                df.loc[idx, START_LON_COL] = picked["_start_lon_med"]
+            if pd.isna(df.loc[idx, END_LAT_COL]):
+                df.loc[idx, END_LAT_COL] = picked["_end_lat_med"]
+            if pd.isna(df.loc[idx, END_LON_COL]):
+                df.loc[idx, END_LON_COL] = picked["_end_lon_med"]
+            filled_time_window.append(idx)
+
+        stats["both_null_time_window"] += int(len(filled_time_window))
+
+    # ---------- D. 起终点都缺：再按 uid + line 全局 ----------
+    both_null_mask = bus_mask & line_ok & df[START_STATION_COL].isna() & df[END_STATION_COL].isna()
+    if both_null_mask.any() and not profiles["pair_overall"].empty:
+        key_cols = [UID_COL, LINE_COL]
+        pair_map = profiles["pair_overall"][[UID_COL, LINE_COL, START_STATION_COL, END_STATION_COL, "_start_lat_med", "_start_lon_med", "_end_lat_med", "_end_lon_med"]]
+        merged_pair = _merge_by_index(df.loc[both_null_mask, key_cols], pair_map, key_cols)
+        fill_idx = merged_pair.index[merged_pair[START_STATION_COL].notna() & merged_pair[END_STATION_COL].notna()]
+        if len(fill_idx) > 0:
+            df.loc[fill_idx, START_STATION_COL] = merged_pair.loc[fill_idx, START_STATION_COL]
+            df.loc[fill_idx, END_STATION_COL] = merged_pair.loc[fill_idx, END_STATION_COL]
+            start_lat_missing_idx = fill_idx[df.loc[fill_idx, START_LAT_COL].isna()]
+            start_lon_missing_idx = fill_idx[df.loc[fill_idx, START_LON_COL].isna()]
+            end_lat_missing_idx = fill_idx[df.loc[fill_idx, END_LAT_COL].isna()]
+            end_lon_missing_idx = fill_idx[df.loc[fill_idx, END_LON_COL].isna()]
+            if len(start_lat_missing_idx) > 0:
+                df.loc[start_lat_missing_idx, START_LAT_COL] = merged_pair.loc[start_lat_missing_idx, "_start_lat_med"]
+            if len(start_lon_missing_idx) > 0:
+                df.loc[start_lon_missing_idx, START_LON_COL] = merged_pair.loc[start_lon_missing_idx, "_start_lon_med"]
+            if len(end_lat_missing_idx) > 0:
+                df.loc[end_lat_missing_idx, END_LAT_COL] = merged_pair.loc[end_lat_missing_idx, "_end_lat_med"]
+            if len(end_lon_missing_idx) > 0:
+                df.loc[end_lon_missing_idx, END_LON_COL] = merged_pair.loc[end_lon_missing_idx, "_end_lon_med"]
+            stats["both_null_line_global"] += int(len(fill_idx))
+
+    return stats
+
+
+def layer2_home_anchor_fill(df: pd.DataFrame, station_to_coord: pd.DataFrame) -> None:
+    """第三层：家锚点仅对每日第一条记录的起点和最后一条记录的终点生效。"""
+    bus_mask = get_bus_mask(df)
+    home_anchor = build_home_anchor(df)
+    if home_anchor.empty:
+        return
+
+    profile_df = df[[UID_COL, "_trip_date"]].copy().merge(home_anchor, on=UID_COL, how="left")
+    profile_df.index = df.index
+
+    valid_day_mask = df["_trip_date"].notna()
+    first_trip_mask = pd.Series(False, index=df.index)
+    last_trip_mask = pd.Series(False, index=df.index)
+
+    if valid_day_mask.any():
+        ordered = df.loc[valid_day_mask, [UID_COL, "_trip_date", TIME_COL]].copy()
+        first_idx = ordered.groupby([UID_COL, "_trip_date"], sort=False).head(1).index
+        last_idx = ordered.groupby([UID_COL, "_trip_date"], sort=False).tail(1).index
+        first_trip_mask.loc[first_idx] = True
+        last_trip_mask.loc[last_idx] = True
+
+    start_home_mask = (
+        bus_mask
+        & first_trip_mask
+        & df[START_STATION_COL].isna()
+        & profile_df["_home_station"].notna()
+    )
+    end_home_mask = (
+        bus_mask
+        & last_trip_mask
+        & df[END_STATION_COL].isna()
+        & profile_df["_home_station"].notna()
+    )
+
+    df.loc[start_home_mask, START_STATION_COL] = profile_df.loc[start_home_mask, "_home_station"]
+    df.loc[end_home_mask, END_STATION_COL] = profile_df.loc[end_home_mask, "_home_station"]
+
+    fill_coords_from_station(df, station_to_coord, START_STATION_COL, START_LAT_COL, START_LON_COL, start_home_mask)
+    fill_coords_from_station(df, station_to_coord, END_STATION_COL, END_LAT_COL, END_LON_COL, end_home_mask)
+
+
+
+def layer3_chain_fill(df: pd.DataFrame) -> None:
+    """第二层：按 uid+时间排序后，用上一条终点/下一条起点填补公交缺失。前后记录可为任意方式。"""
+    grouped = df.groupby(UID_COL, sort=False)
+
+    prev_end_station = grouped[END_STATION_COL].shift(1)
+    prev_end_lat = grouped[END_LAT_COL].shift(1)
+    prev_end_lon = grouped[END_LON_COL].shift(1)
+
+    next_start_station = grouped[START_STATION_COL].shift(-1)
+    next_start_lat = grouped[START_LAT_COL].shift(-1)
+    next_start_lon = grouped[START_LON_COL].shift(-1)
+
+    bus_mask = get_bus_mask(df)
+    start_side_missing_row = bus_mask & df[START_STATION_COL].isna()
+    end_side_missing_row = bus_mask & df[END_STATION_COL].isna()
+
+    start_station_fill_mask = start_side_missing_row & prev_end_station.notna()
+    start_lat_fill_mask = start_side_missing_row & df[START_LAT_COL].isna() & prev_end_lat.notna()
+    start_lon_fill_mask = start_side_missing_row & df[START_LON_COL].isna() & prev_end_lon.notna()
+
+    df.loc[start_station_fill_mask, START_STATION_COL] = prev_end_station[start_station_fill_mask]
+    df.loc[start_lat_fill_mask, START_LAT_COL] = prev_end_lat[start_lat_fill_mask]
+    df.loc[start_lon_fill_mask, START_LON_COL] = prev_end_lon[start_lon_fill_mask]
+
+    end_station_fill_mask = end_side_missing_row & next_start_station.notna()
+    end_lat_fill_mask = end_side_missing_row & df[END_LAT_COL].isna() & next_start_lat.notna()
+    end_lon_fill_mask = end_side_missing_row & df[END_LON_COL].isna() & next_start_lon.notna()
+
+    df.loc[end_station_fill_mask, END_STATION_COL] = next_start_station[end_station_fill_mask]
+    df.loc[end_lat_fill_mask, END_LAT_COL] = next_start_lat[end_lat_fill_mask]
+    df.loc[end_lon_fill_mask, END_LON_COL] = next_start_lon[end_lon_fill_mask]
+
+
+
+def layer4_station_dict_fill(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[int, pd.Series]]:
+    """第一层：站点字典补全。"""
+    station_to_coord, coord_maps = build_station_dictionary(df)
+    bus_mask = get_bus_mask(df)
+
+    # 先用站名补坐标
+    fill_coords_from_station(df, station_to_coord, START_STATION_COL, START_LAT_COL, START_LON_COL, bus_mask)
+    fill_coords_from_station(df, station_to_coord, END_STATION_COL, END_LAT_COL, END_LON_COL, bus_mask)
+
+    # 再用坐标补站名
+    fill_station_from_coords(df, coord_maps, START_STATION_COL, START_LAT_COL, START_LON_COL, bus_mask)
+    fill_station_from_coords(df, coord_maps, END_STATION_COL, END_LAT_COL, END_LON_COL, bus_mask)
+
+    # 若刚补出站名，再回填坐标
+    fill_coords_from_station(df, station_to_coord, START_STATION_COL, START_LAT_COL, START_LON_COL, bus_mask)
+    fill_coords_from_station(df, station_to_coord, END_STATION_COL, END_LAT_COL, END_LON_COL, bus_mask)
+    return station_to_coord, coord_maps
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 读取
+    df, used_encoding = read_csv_auto_encoding(INPUT_FILE)
+    original_columns = df.columns.tolist()
+
+    missing_cols = [col for col in REQUIRED_COLS if col not in df.columns]
+    if missing_cols:
+        raise KeyError(f"缺少必要字段：{missing_cols}")
+
+    original_total_records = int(len(df))
+
+    # 统一缺失表示
+    for col in [MODE_COL, LINE_COL, START_STATION_COL, END_STATION_COL]:
+        df[col] = normalize_null_like(df[col])
+    df[LINE_COL] = normalize_line_value(df[LINE_COL])
+    for col in [START_LAT_COL, START_LON_COL, END_LAT_COL, END_LON_COL]:
+        df[col] = pd.to_numeric(normalize_null_like(df[col]), errors="coerce")
+
+    # 时间解析
+    df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce")
+    invalid_time_count = int(df[TIME_COL].isna().sum())
+
+    # 处理前统计
+    original_bus_total = int(get_bus_mask(df).sum())
+    original_bus_null_records = int(get_bus_null_record_mask(df).sum())
+    original_bus_null_ratio = format_ratio(original_bus_null_records, original_bus_total)
+
+    # 增加时间辅助字段
+    df = add_time_features(df)
+
+    # Step 1：删同一 uid 中一天只有一次出行的那一天记录
+    valid_date_mask = df["_trip_date"].notna()
+    trip_count_per_uid_day = (
+        df.loc[valid_date_mask]
+        .groupby([UID_COL, "_trip_date"])[TIME_COL]
+        .transform("count")
+    )
+    remove_single_trip_day_mask = valid_date_mask & (trip_count_per_uid_day == 1)
+    removed_single_trip_day_records = int(remove_single_trip_day_mask.sum())
+    df = df.loc[~remove_single_trip_day_mask].copy()
+
+    # 排序
+    df = df.sort_values(by=[UID_COL, TIME_COL], kind="mergesort").reset_index(drop=True)
+    df = add_time_features(df)
+
+    # 循环补全前缺失状态
+    before_all_fill = capture_missing_state(df)
+
+    # 四层循环补全（第一层 line 模式匹配 -> 第二层家锚点 -> 第三层链式 -> 第四层站点字典）
+    total_iterations = 0
+    effective_iterations = 0
+
+    layer0_filled_records = 0
+    layer1_filled_records = 0
+    layer2_filled_records = 0
+    layer3_filled_records = 0
+
+    line_fill_detail_total = {
+        "start_from_same_line_end_match": 0,
+        "end_from_same_line_start_match": 0,
+        "both_null_time_window": 0,
+        "both_null_line_global": 0,
+    }
+
+    station_to_coord = pd.DataFrame(columns=["station", "lat", "lon"])
+
+    for _ in range(MAX_FILL_ITERATIONS):
+        total_iterations += 1
+        iteration_new = 0
+
+        # 第一层：站点字典补全
+        before_l0 = capture_missing_state(df)
+        station_to_coord, _ = layer4_station_dict_fill(df)
+        layer0_new = int((get_bus_mask(df) & compute_newly_filled_mask(before_l0, df)).sum())
+        layer0_filled_records += layer0_new
+        iteration_new += layer0_new
+
+        # 第二层：前后出行链式补全
+        before_l1 = capture_missing_state(df)
+        layer3_chain_fill(df)
+        layer1_new = int((get_bus_mask(df) & compute_newly_filled_mask(before_l1, df)).sum())
+        layer1_filled_records += layer1_new
+        iteration_new += layer1_new
+
+        # 第三层：家锚点补全
+        before_l2 = capture_missing_state(df)
+        layer2_home_anchor_fill(df, station_to_coord)
+        layer2_new = int((get_bus_mask(df) & compute_newly_filled_mask(before_l2, df)).sum())
+        layer2_filled_records += layer2_new
+        iteration_new += layer2_new
+
+        # 第四层：同 uid 历史 line 模式匹配补全
+        before_l3 = capture_missing_state(df)
+        line_fill_detail_iter = layer0_line_match_fill(df)
+        layer3_new = int((get_bus_mask(df) & compute_newly_filled_mask(before_l3, df)).sum())
+        layer3_filled_records += layer3_new
+        iteration_new += layer3_new
+        for k in line_fill_detail_total:
+            line_fill_detail_total[k] += int(line_fill_detail_iter.get(k, 0))
+
+        if iteration_new > 0:
+            effective_iterations += 1
+
+        if iteration_new == 0:
+            break
+
+    processed_record_count = int((get_bus_mask(df) & compute_newly_filled_mask(before_all_fill, df)).sum())
+
+    # 填补后但清洗前统计
+    total_records_after_fill = int(len(df))
+    bus_total_after_fill = int(get_bus_mask(df).sum())
+    bus_null_after_fill_records = int(get_bus_null_record_mask(df).sum())
+    bus_null_ratio_after_fill = format_ratio(bus_null_after_fill_records, bus_total_after_fill)
+
+    # Step 3：删 start_station == end_station（仅删该条）
+    start_station_str = df[START_STATION_COL].astype("string").str.strip()
+    end_station_str = df[END_STATION_COL].astype("string").str.strip()
+    same_station_mask = start_station_str.notna() & end_station_str.notna() & (start_station_str == end_station_str)
+    removed_same_station_records = int(same_station_mask.sum())
+    removed_same_station_bus_records = int((same_station_mask & get_bus_mask(df)).sum())
+    df = df.loc[~same_station_mask].copy()
+
+    # Step 4：处理后仍缺失的公交记录 -> 删除该 uid 该日全部记录
+    df = add_time_features(df)
+    bus_still_null_mask = get_bus_null_record_mask(df)
+
+    # 日期可解析：删 uid-日期 对应的全天记录
+    valid_day_null_mask = bus_still_null_mask & df["_trip_date"].notna()
+    affected_uid_day_pairs = df.loc[valid_day_null_mask, [UID_COL, "_trip_date"]].drop_duplicates()
+    removed_uid_day_count = int(len(affected_uid_day_pairs))
+
+    if removed_uid_day_count > 0:
+        affected_pairs_index = set(zip(affected_uid_day_pairs[UID_COL], affected_uid_day_pairs["_trip_date"]))
+        remove_whole_day_mask = pd.Series(
+            list(zip(df[UID_COL], df["_trip_date"])), index=df.index
+        ).isin(affected_pairs_index)
+    else:
+        remove_whole_day_mask = pd.Series(False, index=df.index)
+
+    removed_total_records_by_uid_day = int(remove_whole_day_mask.sum())
+    removed_bus_records_in_uid_day = int((remove_whole_day_mask & get_bus_mask(df)).sum())
+
+    # 日期不可解析：只删该条仍缺失公交记录
+    invalid_day_single_remove_mask = bus_still_null_mask & df["_trip_date"].isna()
+    invalid_day_single_remove_count = int(invalid_day_single_remove_mask.sum())
+
+    final_remove_mask = remove_whole_day_mask | invalid_day_single_remove_mask
+    df = df.loc[~final_remove_mask].copy()
+
+    # 最终统计
+    final_total_records = int(len(df))
+    final_bus_total = int(get_bus_mask(df).sum())
+    final_bus_null_records = int(get_bus_null_record_mask(df).sum())
+    final_bus_null_ratio = format_ratio(final_bus_null_records, final_bus_total)
+
+    # 删除辅助字段并恢复原列顺序
+    helper_cols = ["_trip_date", "_hour", "_minute_of_day"]
+    existing_helper_cols = [c for c in helper_cols if c in df.columns]
+    if existing_helper_cols:
+        df = df.drop(columns=existing_helper_cols)
+
+    df = df[original_columns]
+
+    if pd.api.types.is_datetime64_any_dtype(df[TIME_COL]):
+        df[TIME_COL] = df[TIME_COL].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 保存 CSV
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    # 统计说明
+    report_lines = [
+        "公交缺失记录处理统计说明",
+        "=" * 44,
+        f"输入文件：{INPUT_FILE}",
+        f"读取编码：{used_encoding}",
+        f"输出文件：{OUTPUT_CSV}",
+        f"统计文件：{OUTPUT_TXT}",
+        "",
+        "一、原始总体情况（处理前）",
+        f"1. 总出行记录条数：{original_total_records}",
+        f"2. 公交总记录条数：{original_bus_total}",
+        f"3. 公交中 start_station 或 end_station 为 null 的记录条数：{original_bus_null_records}",
+        f"4. 原始公交缺失比例：{original_bus_null_ratio}",
+        "",
+        "二、数据清洗与循环补全过程",
+        f"1. 清洗掉同一 uid 中一天只有一次出行的记录条数：{removed_single_trip_day_records}",
+        f"2. 第一层（站点字典补全）循环累计新增填补的公交记录条数：{layer0_filled_records}",
+        f"3. 第二层（前后出行链式补全）循环累计新增填补的公交记录条数：{layer1_filled_records}",
+        f"4. 第三层（家锚点补全）循环累计新增填补的公交记录条数：{layer2_filled_records}",
+        f"5. 第四层（同 uid 历史 line 模式匹配补全）循环累计成功填补的公交记录条数：{layer3_filled_records}",
+        f"   - 其中：仅起点缺且由相同 line + 已知终点反查起点补全的记录条数：{line_fill_detail_total['start_from_same_line_end_match']}",
+        f"   - 其中：仅终点缺且由相同 line + 已知起点反查终点补全的记录条数：{line_fill_detail_total['end_from_same_line_start_match']}",
+        f"   - 其中：起终点都缺且由 uid + line + 前后各一小时窗口匹配补全的记录条数：{line_fill_detail_total['both_null_time_window']}",
+        f"   - 其中：起终点都缺且由 uid + line 全局匹配补全的记录条数：{line_fill_detail_total['both_null_line_global']}",
+        f"6. 循环补全总轮数：{total_iterations}",
+        f"7. 其中实际发生新增填补的轮数：{effective_iterations}",
+        f"8. 四层循环补全合计成功填补的公交记录条数：{processed_record_count}",
+        f"9. 填补后（进一步清洗前）总出行记录条数：{total_records_after_fill}",
+        f"10. 填补后（进一步清洗前）公交缺失记录条数：{bus_null_after_fill_records}",
+        f"11. 填补后（进一步清洗前）公交缺失比例：{bus_null_ratio_after_fill}",
+        f"12. 清洗掉 start_station 与 end_station 相同的记录条数（仅删除该条）：{removed_same_station_records}",
+        f"13. 其中公交中清洗掉 start_station 与 end_station 相同的记录条数：{removed_same_station_bus_records}",
+        f"14. 因还原后公交仍存在 null 而删除的 uid-日期数量：{removed_uid_day_count}",
+        f"15. 因上述整天删除而移除的总记录条数：{removed_total_records_by_uid_day}",
+        f"16. 上述整天删除中包含的公交记录条数：{removed_bus_records_in_uid_day}",
+        f"17. 因时间无法解析，无法定位具体日期而被单独删除的仍缺失公交记录条数：{invalid_day_single_remove_count}",
+        "",
+        "三、最终结果（删除无效记录后）",
+        f"1. 最终总出行记录条数：{final_total_records}",
+        f"2. 最终公交总记录条数：{final_bus_total}",
+        f"3. 最终公交缺失记录条数：{final_bus_null_records}",
+        f"4. 最终公交缺失比例：{final_bus_null_ratio}",
+        "",
+        "四、比例变化说明",
+        f"公交记录中缺失记录占比由原本 {original_bus_null_ratio} 减少为 {final_bus_null_ratio}。",
+        "",
+        "五、补充说明",
+        "1. 缺失按‘记录条数’统计：同一条公交记录即使 start_station 和 end_station 同时为 null，也只计 1 条。",
+        "2. 填补时仅对原本为 null 的字段赋值，不覆盖原本已有的非空值。",
+        "3. 第一层现改为同 uid + line 的历史线路匹配：单侧缺失时按已知起点/终点直接反查；双侧缺失时优先按前后各一小时窗口查找，再退回到 uid + line 全局查找。",
+        "4. 第二层现为家锚点补全：家锚点由‘每日第一次出行起点’和‘每日最后一次出行终点’共同构建，且不再受时间段限制。",
+        "5. 第三层仍沿用原有链式补全：以同一 uid 的上一条记录终点和下一条记录起点补公交缺失，前后记录可为任意出行方式。",
+        "6. 第四层为站点字典补全：基于历史公交完整记录中的‘站名-坐标’对应关系进行站名/坐标互补。",
+        "7. 四层补全采用循环方式执行，因此后层新增补出的信息可以在下一轮继续参与前层补全。",
+        f"8. 无法解析的 {TIME_COL} 条数：{invalid_time_count}。",
+        "9. line 字段在匹配前会统一规范化（去空格、统一 + 连接符、小写化），以提高相同线路的匹配稳定性。",
+    ]
+
+    with open(OUTPUT_TXT, "w", encoding="utf-8-sig") as f:
+        f.write("\n".join(report_lines))
+
+    print("处理完成！")
+    print(f"原始总出行记录：{original_total_records}")
+    print(f"最终总出行记录：{final_total_records}")
+    print(f"输出 CSV：{OUTPUT_CSV}")
+    print(f"输出 TXT：{OUTPUT_TXT}")
+
+
+if __name__ == "__main__":
+    main()
